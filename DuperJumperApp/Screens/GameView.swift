@@ -86,7 +86,11 @@ struct GameView: View {
         .animation(reduceMotion ? nil : .snappy(duration: 0.22), value: store.progress.currentHeight)
         .animation(reduceMotion ? nil : .snappy(duration: 0.22), value: store.progress.currentMultiplier)
         .onAppear {
+            AppDelegate.lockGameOrientation()
             restoreVisualOutcomeIfNeeded()
+        }
+        .onDisappear {
+            AppDelegate.restoreDefaultOrientations()
         }
     }
 

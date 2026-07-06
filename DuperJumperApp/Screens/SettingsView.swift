@@ -119,16 +119,16 @@ struct SettingsView: View {
                     title: "Privacy Policy",
                     subtitle: "Data and privacy details.",
                     systemImage: "hand.raised.fill",
-                    url: URL(string: "https://docs.google.com/document/d/1Zm724okniiNBNBf-L8y5giQ9zVMDOsChV3exS2A69v4/edit?usp=sharing")!
+                    url: AppConfiguration.privacyPolicyURL
                 )
 
                 SettingsDivider()
 
                 settingsLinkButton(
-                    title: "Terms of Use",
-                    subtitle: "Usage rules and terms.",
-                    systemImage: "doc.text.fill",
-                    url: URL(string: "https://docs.google.com/document/d/1vYp9Sq1VfxA461BJjngl7ot6CSawJ0b1RmpS0cT_wbE/edit?usp=sharing")!
+                    title: "Support",
+                    subtitle: "Help and contact details.",
+                    systemImage: "questionmark.circle.fill",
+                    url: AppConfiguration.supportURL
                 )
             }
         }
