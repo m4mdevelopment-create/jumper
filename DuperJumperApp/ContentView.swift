@@ -17,7 +17,7 @@ struct ContentView: View {
         .environment(gameStore)
         .preferredColorScheme(.dark)
         .task {
-            await AppDelegate.requestTrackingAuthorizationAndStartAppsFlyer()
+            AppDelegate.startAppsFlyerForLaunch()
             await launchCoordinator.start()
         }
     }
@@ -42,8 +42,9 @@ struct ContentView: View {
                     launchCoordinator.skipNotifications()
                 }
             )
-        case .webView(let url):
-            DuperWebView(url: url)
+        case .webView(let request):
+            DuperWebView(url: request.url, requestID: request.id)
+                .ignoresSafeArea(.keyboard, edges: .bottom)
         }
     }
 

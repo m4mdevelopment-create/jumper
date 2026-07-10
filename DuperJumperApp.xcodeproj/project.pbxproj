@@ -373,7 +373,7 @@
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = NO;
 				INFOPLIST_FILE = "Config/DuperJumperApp-Info.plist";
-				INFOPLIST_KEY_CFBundleDisplayName = "Steady Flow";
+				INFOPLIST_KEY_CFBundleDisplayName = "SteadyFlowplay: Jumping Block";
 				IPHONEOS_DEPLOYMENT_TARGET = 18;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
@@ -412,7 +412,7 @@
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = NO;
 				INFOPLIST_FILE = "Config/DuperJumperApp-Info.plist";
-				INFOPLIST_KEY_CFBundleDisplayName = "Steady Flow";
+				INFOPLIST_KEY_CFBundleDisplayName = "SteadyFlowplay: Jumping Block";
 				IPHONEOS_DEPLOYMENT_TARGET = 18;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",

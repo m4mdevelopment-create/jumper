@@ -5,7 +5,7 @@
 	<key>CFBundleDevelopmentRegion</key>
 	<string>$(DEVELOPMENT_LANGUAGE)</string>
 	<key>CFBundleDisplayName</key>
-	<string>Steady Flow</string>
+	<string>SteadyFlowplay: Jumping Block</string>
 	<key>CFBundleExecutable</key>
 	<string>$(EXECUTABLE_NAME)</string>
 	<key>CFBundleIdentifier</key>
@@ -28,8 +28,6 @@
 	<string>Web pages opened in the app can save selected uploads when the site requests it.</string>
 	<key>NSPhotoLibraryUsageDescription</key>
 	<string>Web pages opened in the app can ask to upload a photo from the library.</string>
-	<key>NSUserTrackingUsageDescription</key>
-	<string>This identifier helps attribute app installs from advertising links.</string>
 	<key>UIApplicationSceneManifest</key>
 	<dict>
 		<key>UIApplicationSupportsMultipleScenes</key>

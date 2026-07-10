@@ -6,7 +6,17 @@ enum AppLaunchRoute: Equatable {
     case noInternet(message: String)
     case fanContent
     case notificationPrompt(URL)
-    case webView(URL)
+    case webView(WebViewLaunchRequest)
+}
+
+struct WebViewLaunchRequest: Equatable {
+    let id: UUID
+    let url: URL
+
+    init(url: URL, id: UUID = UUID()) {
+        self.id = id
+        self.url = url
+    }
 }
 
 @MainActor
@@ -20,10 +30,14 @@ final class AppLaunchCoordinator {
     @ObservationIgnored private let configClient: ConfigClient
     @ObservationIgnored private var storedState: StoredLaunchState
     @ObservationIgnored private var didStart = false
+    @ObservationIgnored private var isWaitingForLateAttribution = false
+    @ObservationIgnored private var isRetryingAfterLateAttribution = false
 
     private static let storageKey = "steadyflow.launch.state.v1"
-    private static let conversionWaitTimeout: TimeInterval = 5
+    private static let conversionWaitTimeout: TimeInterval = 6.5
     private static let deepLinkWaitTimeout: TimeInterval = 1
+    private static let firstLaunchConfigTimeout: TimeInterval = 3
+    private static let lateAttributionConfigTimeout: TimeInterval = 3
     private static let notificationPromptDelay: TimeInterval = 3 * 24 * 60 * 60
 
     init(
@@ -39,18 +53,51 @@ final class AppLaunchCoordinator {
     func start() async {
         guard !didStart else { return }
         didStart = true
+        logPush(
+            "start",
+            details: [
+                "storedMode=\(storedState.mode?.rawValue ?? "nil")",
+                "initialRoute=\(route.duperPushDebugLabel)"
+            ]
+        )
 
         pushService.notificationURLHandler = { [weak self] url in
-            self?.openNotificationURL(url)
+            self?.logPush(
+                "notification-url-handler-received",
+                details: ["url=\(url.absoluteString)"]
+            )
+            _ = self?.openNotificationURL(url)
         }
         pushService.tokenUpdatedHandler = { [weak self] _ in
+            self?.logPush("fcm-token-updated-handler")
             Task { @MainActor in
                 await self?.refreshConfigAfterPushTokenChange()
             }
         }
+        attributionService.attributionUpdatedHandler = { [weak self] in
+            self?.logPush("attribution-updated-handler")
+            Task { @MainActor in
+                await self?.retryConfigAfterLateAttributionIfNeeded()
+            }
+        }
 
-        if let notificationURL = pushService.consumePendingNotificationURL() {
-            openNotificationURL(notificationURL)
+        if pushService.deliverPendingNotificationURLIfPossible(source: "coordinator-start") {
+            logPush(
+                "pending-notification-url-open-result",
+                details: ["didOpen=true"]
+            )
+            return
+        }
+
+        if pushService.hasPendingNotificationURL {
+            route = .loading(message: "Opening notification")
+            logPush(
+                "pending-notification-url-waiting",
+                details: [
+                    "url=\(pushService.pendingNotificationURLDescription)",
+                    "reason=waiting-for-active-or-handler"
+                ]
+            )
             return
         }
 
@@ -69,7 +116,7 @@ final class AppLaunchCoordinator {
         Task {
             await pushService.requestAuthorizationAndRegister()
             let refreshedURL = await refreshConfigAfterPushTokenChange()
-            route = .webView(refreshedURL ?? url)
+            route = .webView(WebViewLaunchRequest(url: refreshedURL ?? url))
         }
     }
 
@@ -78,7 +125,7 @@ final class AppLaunchCoordinator {
 
         storedState.lastNotificationPromptSkipAt = .now
         persistState()
-        route = .webView(url)
+        route = .webView(WebViewLaunchRequest(url: url))
     }
 
     private func resolveLaunch() async {
@@ -99,20 +146,45 @@ final class AppLaunchCoordinator {
             timeout: Self.conversionWaitTimeout,
             deepLinkTimeout: Self.deepLinkWaitTimeout
         )
-        let result = await configClient.fetchLink(payload: payload, pushToken: pushService.fcmToken)
+        logPush(
+            "first-launch-config-fetch",
+            details: [
+                "payloadResolution=\(payload.resolution.debugLabel)",
+                "timeout=\(Self.firstLaunchConfigTimeout)"
+            ]
+        )
+        let result = await configClient.fetchLink(
+            payload: payload,
+            pushToken: pushService.fcmToken,
+            timeoutInterval: Self.firstLaunchConfigTimeout
+        )
 
         switch result {
         case .success(let url, let expiresAt):
+            isWaitingForLateAttribution = false
             storedState.mode = .webView
             storedState.lastWebURL = url
             storedState.expiresAt = expiresAt
             persistState()
             await presentWebView(url)
         case .networkUnavailable:
-            route = .noInternet(message: "Internet connection is required on first launch.")
+            route = .noInternet(message: "Internet connection is required.")
         case .negative:
-            storedState.mode = .fanContent
-            persistState()
+            if payload.resolution.isTimedOut {
+                isWaitingForLateAttribution = true
+                logPush(
+                    "first-launch-negative-temporary-fan",
+                    details: ["reason=attribution-timed-out"]
+                )
+            } else {
+                isWaitingForLateAttribution = false
+                storedState.mode = .fanContent
+                persistState()
+                logPush(
+                    "first-launch-negative-persist-fan",
+                    details: ["payloadResolution=\(payload.resolution.debugLabel)"]
+                )
+            }
             route = .fanContent
         }
     }
@@ -122,11 +194,6 @@ final class AppLaunchCoordinator {
             storedState.mode = nil
             persistState()
             await resolveFirstLaunch()
-            return
-        }
-
-        if let expiresAt = storedState.expiresAt, expiresAt > .now {
-            await presentWebView(savedURL)
             return
         }
 
@@ -143,9 +210,82 @@ final class AppLaunchCoordinator {
             persistState()
             await presentWebView(url)
         case .networkUnavailable:
-            route = .noInternet(message: "Internet connection is required to open WebView.")
+            route = .noInternet(message: "Internet connection is required.")
         case .negative:
             await presentWebView(savedURL)
+        }
+    }
+
+    private func retryConfigAfterLateAttributionIfNeeded() async {
+        guard isWaitingForLateAttribution else {
+            logPush("late-attribution-retry-skip", details: ["reason=not-waiting"])
+            return
+        }
+
+        guard !isRetryingAfterLateAttribution else {
+            logPush("late-attribution-retry-skip", details: ["reason=already-retrying"])
+            return
+        }
+
+        guard storedState.mode == nil else {
+            isWaitingForLateAttribution = false
+            logPush(
+                "late-attribution-retry-skip",
+                details: [
+                    "reason=stored-mode-already-decided",
+                    "storedMode=\(storedState.mode?.rawValue ?? "nil")"
+                ]
+            )
+            return
+        }
+
+        let payload = attributionService.currentPayload()
+        guard payload.resolution.hasResolvedConversion else {
+            logPush(
+                "late-attribution-retry-skip",
+                details: [
+                    "reason=conversion-not-resolved",
+                    "payloadResolution=\(payload.resolution.debugLabel)"
+                ]
+            )
+            return
+        }
+
+        isRetryingAfterLateAttribution = true
+        defer {
+            isRetryingAfterLateAttribution = false
+        }
+
+        logPush(
+            "late-attribution-config-retry-start",
+            details: [
+                "payloadResolution=\(payload.resolution.debugLabel)",
+                "timeout=\(Self.lateAttributionConfigTimeout)"
+            ]
+        )
+
+        let result = await configClient.fetchLink(
+            payload: payload,
+            pushToken: pushService.fcmToken,
+            timeoutInterval: Self.lateAttributionConfigTimeout
+        )
+
+        switch result {
+        case .success(let url, let expiresAt):
+            isWaitingForLateAttribution = false
+            storedState.mode = .webView
+            storedState.lastWebURL = url
+            storedState.expiresAt = expiresAt
+            persistState()
+            logPush("late-attribution-config-retry-success", details: ["url=\(url.absoluteString)"])
+            await presentWebView(url)
+        case .networkUnavailable:
+            logPush("late-attribution-config-retry-network-unavailable")
+        case .negative:
+            isWaitingForLateAttribution = false
+            storedState.mode = .fanContent
+            persistState()
+            logPush("late-attribution-config-retry-negative-persist-fan")
         }
     }
 
@@ -153,7 +293,7 @@ final class AppLaunchCoordinator {
         if await shouldShowNotificationPrompt() {
             route = .notificationPrompt(url)
         } else {
-            route = .webView(url)
+            route = .webView(WebViewLaunchRequest(url: url))
         }
     }
 
@@ -170,29 +310,77 @@ final class AppLaunchCoordinator {
         return true
     }
 
-    private func openNotificationURL(_ url: URL) {
-        route = .webView(url)
+    @discardableResult
+    private func openNotificationURL(_ url: URL) -> Bool {
+        guard url.isHTTPFamily else {
+            logPush(
+                "open-notification-url-rejected",
+                details: [
+                    "url=\(url.absoluteString)",
+                    "reason=non-http-scheme"
+                ]
+            )
+            return false
+        }
+
+        route = .webView(WebViewLaunchRequest(url: url))
+        logPush(
+            "open-notification-url-accepted",
+            details: [
+                "url=\(url.absoluteString)",
+                "route=\(route.duperPushDebugLabel)"
+            ]
+        )
+        return true
     }
 
     @discardableResult
     private func refreshConfigAfterPushTokenChange() async -> URL? {
-        guard storedState.mode == .webView, pushService.fcmToken != nil else { return nil }
+        guard storedState.mode == .webView, pushService.fcmToken != nil else {
+            logPush(
+                "refresh-config-after-push-token-skip",
+                details: [
+                    "storedMode=\(storedState.mode?.rawValue ?? "nil")",
+                    "hasFcmToken=\(pushService.fcmToken != nil)"
+                ]
+            )
+            return nil
+        }
 
         let result = await configClient.fetchLink(
             payload: attributionService.currentPayload(),
             pushToken: pushService.fcmToken
         )
 
-        guard case .success(let url, let expiresAt) = result else { return nil }
+        guard case .success(let url, let expiresAt) = result else {
+            logPush("refresh-config-after-push-token-no-success")
+            return nil
+        }
+
         storedState.lastWebURL = url
         storedState.expiresAt = expiresAt
         persistState()
+        logPush(
+            "refresh-config-after-push-token-success",
+            details: ["url=\(url.absoluteString)"]
+        )
         return url
     }
 
     private func persistState() {
         guard let data = try? JSONEncoder().encode(storedState) else { return }
         defaults.set(data, forKey: Self.storageKey)
+    }
+
+    private func logPush(_ event: String, details: [String] = []) {
+        var components = [
+            "[DuperPush]",
+            "AppLaunchCoordinator",
+            event
+        ]
+        components.append(contentsOf: details)
+
+        NSLog("%@", components.joined(separator: " | "))
     }
 
     private static func loadState(from defaults: UserDefaults) -> StoredLaunchState {
@@ -217,4 +405,57 @@ private struct StoredLaunchState: Codable {
 private enum StoredLaunchMode: String, Codable {
     case webView
     case fanContent
+}
+
+private extension AttributionResolution {
+    var debugLabel: String {
+        switch self {
+        case .resolved:
+            return "resolved"
+        case .failed:
+            return "failed"
+        case .timedOut:
+            return "timedOut"
+        }
+    }
+
+    var isTimedOut: Bool {
+        if case .timedOut = self {
+            return true
+        }
+
+        return false
+    }
+
+    var hasResolvedConversion: Bool {
+        if case .resolved = self {
+            return true
+        }
+
+        return false
+    }
+}
+
+private extension AppLaunchRoute {
+    var duperPushDebugLabel: String {
+        switch self {
+        case .loading(let message):
+            return "loading(\(message))"
+        case .noInternet(let message):
+            return "noInternet(\(message))"
+        case .fanContent:
+            return "fanContent"
+        case .notificationPrompt(let url):
+            return "notificationPrompt(\(url.absoluteString))"
+        case .webView(let request):
+            return "webView(\(request.url.absoluteString), requestID=\(request.id.uuidString))"
+        }
+    }
+}
+
+private extension URL {
+    var isHTTPFamily: Bool {
+        guard let scheme = scheme?.lowercased() else { return false }
+        return scheme == "http" || scheme == "https"
+    }
 }

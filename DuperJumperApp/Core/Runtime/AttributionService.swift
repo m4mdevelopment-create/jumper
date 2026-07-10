@@ -20,6 +20,7 @@ final class AttributionService {
     private(set) var latestConversionData: [AnyHashable: Any]?
     private(set) var latestDeepLinkData: [AnyHashable: Any] = [:]
     private(set) var latestAppsFlyerID: String?
+    var attributionUpdatedHandler: (() -> Void)?
     private var appsFlyerIDProvider: (() -> String?)?
     private var conversionWaiters: [UUID: CheckedContinuation<AttributionResolution, Never>] = [:]
     private var deepLinkWaiters: [UUID: CheckedContinuation<[AnyHashable: Any], Never>] = [:]
@@ -41,10 +42,12 @@ final class AttributionService {
     func recordConversionData(_ data: [AnyHashable: Any]) {
         latestConversionData = data
         resumeWaiters(with: .resolved(data))
+        attributionUpdatedHandler?()
     }
 
     func recordConversionFailure() {
         resumeWaiters(with: .failed)
+        attributionUpdatedHandler?()
     }
 
     func recordDeepLinkData(_ data: [AnyHashable: Any]) {
@@ -55,17 +58,14 @@ final class AttributionService {
         }
 
         resumeDeepLinkWaiters()
+        attributionUpdatedHandler?()
     }
 
     func initialPayload(timeout seconds: TimeInterval, deepLinkTimeout: TimeInterval) async -> AttributionPayload {
-        var resolution: AttributionResolution
+        async let conversionResolution = resolvedConversionData(timeout: seconds)
+        async let deepLinkData = resolvedDeepLinkData(timeout: deepLinkTimeout)
 
-        if let latestConversionData {
-            resolution = .resolved(latestConversionData)
-        } else {
-            resolution = await waitForConversionData(timeout: seconds)
-        }
-
+        let resolution = await conversionResolution
         let conversionData: [AnyHashable: Any]
         switch resolution {
         case .resolved(let data):
@@ -74,11 +74,9 @@ final class AttributionService {
             conversionData = latestConversionData ?? [:]
         }
 
-        let deepLinkData = await resolvedDeepLinkData(timeout: deepLinkTimeout)
-
         return AttributionPayload(
             conversionData: conversionData,
-            deepLinkData: deepLinkData,
+            deepLinkData: await deepLinkData,
             resolution: resolution,
             appsFlyerID: resolvedAppsFlyerID
         )
@@ -114,6 +112,14 @@ final class AttributionService {
         }
 
         return nil
+    }
+
+    private func resolvedConversionData(timeout seconds: TimeInterval) async -> AttributionResolution {
+        if let latestConversionData {
+            return .resolved(latestConversionData)
+        }
+
+        return await waitForConversionData(timeout: seconds)
     }
 
     private func resolvedDeepLinkData(timeout seconds: TimeInterval) async -> [AnyHashable: Any] {

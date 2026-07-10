@@ -1,4 +1,3 @@
-import AppTrackingTransparency
 import AppsFlyerLib
 import FirebaseCore
 import FirebaseMessaging
@@ -26,6 +25,14 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
         Messaging.messaging().delegate = self
         UNUserNotificationCenter.current().delegate = self
         configureAppsFlyer()
+        logPush(
+            "did-finish-launching",
+            details: [
+                "launchOptionsKeys=\(Self.launchOptionKeysDescription(launchOptions))",
+                "hasRemoteNotification=\(launchOptions?[.remoteNotification] != nil)"
+            ]
+        )
+        handleLaunchNotificationIfNeeded(launchOptions)
         return true
     }
 
@@ -82,15 +89,25 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
     }
 
     func applicationDidBecomeActive(_ application: UIApplication) {
-        Task {
-            await requestTrackingAuthorizationAndStartAppsFlyer()
+        logPush("did-become-active")
+        Task { @MainActor in
+            startAppsFlyerOnce()
+            PushNotificationService.shared.deliverPendingNotificationURLIfPossible(source: "application-did-become-active")
         }
+    }
+
+    func applicationWillEnterForeground(_ application: UIApplication) {
+        logPush("will-enter-foreground")
     }
 
     func application(
         _ application: UIApplication,
         didRegisterForRemoteNotificationsWithDeviceToken deviceToken: Data
     ) {
+        logPush(
+            "did-register-apns-token",
+            details: ["token=\(Self.redactedDeviceToken(deviceToken))"]
+        )
         Messaging.messaging().apnsToken = deviceToken
         AppsFlyerLib.shared().registerUninstall(deviceToken)
     }
@@ -100,6 +117,7 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
         didReceiveRemoteNotification userInfo: [AnyHashable: Any],
         fetchCompletionHandler completionHandler: @escaping (UIBackgroundFetchResult) -> Void
     ) {
+        logPush("did-receive-remote-notification-fetch", userInfo: userInfo)
         AppsFlyerLib.shared().handlePushNotification(userInfo)
 
         completionHandler(.noData)
@@ -131,13 +149,39 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
         appsFlyer.deepLinkDelegate = self
         registerAppsFlyerIDProvider()
 
-        if #available(iOS 14, *) {
-            appsFlyer.waitForATTUserAuthorization(timeoutInterval: 5)
-        }
-
         #if DEBUG
         appsFlyer.isDebug = true
         #endif
+    }
+
+    private func handleLaunchNotificationIfNeeded(
+        _ launchOptions: [UIApplication.LaunchOptionsKey: Any]?
+    ) {
+        guard
+            let userInfo = launchOptions?[.remoteNotification] as? [AnyHashable: Any]
+        else {
+            logPush("cold-start-no-remote-notification")
+            return
+        }
+
+        logPush("cold-start-remote-notification", userInfo: userInfo)
+        handleNotificationOpen(userInfo)
+    }
+
+    private func handleNotificationOpen(_ userInfo: [AnyHashable: Any]) {
+        logPush("notification-open-received", userInfo: userInfo)
+        AppsFlyerLib.shared().handlePushNotification(userInfo)
+
+        guard let url = PushNotificationService.notificationURL(from: userInfo) else {
+            logPush("notification-open-no-http-url", userInfo: userInfo)
+            return
+        }
+
+        logPush("notification-open-url-selected", details: ["url=\(url.absoluteString)"])
+
+        Task { @MainActor in
+            PushNotificationService.shared.openNotificationURL(url)
+        }
     }
 
     private func registerAppsFlyerIDProvider() {
@@ -149,37 +193,8 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
     }
 
     @MainActor
-    static func requestTrackingAuthorizationAndStartAppsFlyer() async {
-        await shared?.requestTrackingAuthorizationAndStartAppsFlyer()
-    }
-
-    @MainActor
-    private func requestTrackingAuthorizationAndStartAppsFlyer() async {
-        guard !didStartAppsFlyer else { return }
-
-        if #available(iOS 14, *), ATTrackingManager.trackingAuthorizationStatus == .notDetermined {
-            debugATTStatus("will request")
-
-            try? await Task.sleep(nanoseconds: 800_000_000)
-
-            let currentStatus = ATTrackingManager.trackingAuthorizationStatus
-            guard currentStatus == .notDetermined else {
-                debugATTStatus("skipped request", status: currentStatus)
-                startAppsFlyerOnce()
-                return
-            }
-
-            let status = await withCheckedContinuation { continuation in
-                ATTrackingManager.requestTrackingAuthorization { status in
-                    continuation.resume(returning: status)
-                }
-            }
-            debugATTStatus("request completed", status: status)
-            startAppsFlyerOnce()
-            return
-        }
-
-        startAppsFlyerOnce()
+    static func startAppsFlyerForLaunch() {
+        shared?.startAppsFlyerOnce()
     }
 
     @MainActor
@@ -195,28 +210,99 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
         }
     }
 
-    @available(iOS 14, *)
-    private func debugATTStatus(
-        _ context: String,
-        status: ATTrackingManager.AuthorizationStatus = ATTrackingManager.trackingAuthorizationStatus
+    private func logPush(
+        _ event: String,
+        userInfo: [AnyHashable: Any]? = nil,
+        details: [String] = []
     ) {
-        #if DEBUG
-        let label: String
-        switch status {
-        case .notDetermined:
-            label = "notDetermined"
-        case .restricted:
-            label = "restricted"
-        case .denied:
-            label = "denied"
-        case .authorized:
-            label = "authorized"
-        @unknown default:
-            label = "unknown"
+        var components = [
+            "[DuperPush]",
+            "AppDelegate",
+            event,
+            "appState=\(UIApplication.shared.applicationState.duperPushDebugLabel)"
+        ]
+        components.append(contentsOf: details)
+
+        if let userInfo {
+            components.append("payloadKeys=\(Self.payloadKeysDescription(userInfo))")
+            components.append("payload=\(Self.payloadDescription(userInfo))")
         }
 
-        print("[ATT] \(context): \(label)")
-        #endif
+        NSLog("%@", components.joined(separator: " | "))
+    }
+
+    nonisolated private static func launchOptionKeysDescription(
+        _ launchOptions: [UIApplication.LaunchOptionsKey: Any]?
+    ) -> String {
+        guard let launchOptions, !launchOptions.isEmpty else { return "none" }
+
+        return launchOptions.keys
+            .map(\.rawValue)
+            .sorted()
+            .joined(separator: ",")
+    }
+
+    nonisolated private static func payloadKeysDescription(_ userInfo: [AnyHashable: Any]) -> String {
+        userInfo.keys
+            .map { String(describing: $0) }
+            .sorted()
+            .joined(separator: ",")
+    }
+
+    nonisolated private static func payloadDescription(_ userInfo: [AnyHashable: Any]) -> String {
+        let normalized = normalizePayloadValue(userInfo)
+
+        guard
+            JSONSerialization.isValidJSONObject(normalized),
+            let data = try? JSONSerialization.data(
+                withJSONObject: normalized,
+                options: [.sortedKeys]
+            ),
+            let string = String(data: data, encoding: .utf8)
+        else {
+            return String(describing: userInfo)
+        }
+
+        return string
+    }
+
+    nonisolated private static func normalizePayloadValue(_ value: Any) -> Any {
+        if let dictionary = value as? [AnyHashable: Any] {
+            return dictionary.reduce(into: [String: Any]()) { result, entry in
+                result[String(describing: entry.key)] = normalizePayloadValue(entry.value)
+            }
+        }
+
+        if let dictionary = value as? [String: Any] {
+            return dictionary.reduce(into: [String: Any]()) { result, entry in
+                result[entry.key] = normalizePayloadValue(entry.value)
+            }
+        }
+
+        if let array = value as? [Any] {
+            return array.map(normalizePayloadValue)
+        }
+
+        if let number = value as? NSNumber {
+            return number
+        }
+
+        if let string = value as? String {
+            return string
+        }
+
+        if let url = value as? URL {
+            return url.absoluteString
+        }
+
+        return String(describing: value)
+    }
+
+    nonisolated private static func redactedDeviceToken(_ data: Data) -> String {
+        let token = data.map { String(format: "%02x", $0) }.joined()
+        guard token.count > 12 else { return "length=\(token.count)" }
+
+        return "\(token.prefix(6))...\(token.suffix(6)) length=\(token.count)"
     }
 }
 
@@ -259,6 +345,10 @@ extension AppDelegate: DeepLinkDelegate {
 
 extension AppDelegate: MessagingDelegate {
     func messaging(_ messaging: Messaging, didReceiveRegistrationToken fcmToken: String?) {
+        logPush(
+            "did-receive-fcm-token",
+            details: ["token=\(Self.redactedStringToken(fcmToken))"]
+        )
         Task { @MainActor in
             PushNotificationService.shared.updateToken(fcmToken)
         }
@@ -271,6 +361,14 @@ extension AppDelegate: UNUserNotificationCenterDelegate {
         willPresent notification: UNNotification,
         withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void
     ) {
+        logPush(
+            "will-present-notification",
+            userInfo: notification.request.content.userInfo,
+            details: [
+                "requestIdentifier=\(notification.request.identifier)",
+                "category=\(notification.request.content.categoryIdentifier)"
+            ]
+        )
         completionHandler([.banner, .sound, .badge])
     }
 
@@ -280,14 +378,41 @@ extension AppDelegate: UNUserNotificationCenterDelegate {
         withCompletionHandler completionHandler: @escaping () -> Void
     ) {
         let userInfo = response.notification.request.content.userInfo
-        AppsFlyerLib.shared().handlePushNotification(userInfo)
-
-        if let url = PushNotificationService.notificationURL(from: userInfo) {
-            Task { @MainActor in
-                PushNotificationService.shared.openNotificationURL(url)
-            }
-        }
+        logPush(
+            "did-receive-notification-response",
+            userInfo: userInfo,
+            details: [
+                "actionIdentifier=\(response.actionIdentifier)",
+                "requestIdentifier=\(response.notification.request.identifier)",
+                "category=\(response.notification.request.content.categoryIdentifier)"
+            ]
+        )
+        handleNotificationOpen(userInfo)
 
         completionHandler()
+    }
+}
+
+private extension AppDelegate {
+    nonisolated static func redactedStringToken(_ token: String?) -> String {
+        guard let token, !token.isEmpty else { return "nil" }
+        guard token.count > 12 else { return "length=\(token.count)" }
+
+        return "\(token.prefix(6))...\(token.suffix(6)) length=\(token.count)"
+    }
+}
+
+private extension UIApplication.State {
+    var duperPushDebugLabel: String {
+        switch self {
+        case .active:
+            return "active"
+        case .inactive:
+            return "inactive"
+        case .background:
+            return "background"
+        @unknown default:
+            return "unknown"
+        }
     }
 }

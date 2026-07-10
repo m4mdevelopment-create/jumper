@@ -15,13 +15,14 @@ struct ConfigClient {
 
     func fetchLink(
         payload: AttributionPayload,
-        pushToken: String?
+        pushToken: String?,
+        timeoutInterval: TimeInterval = 4
     ) async -> ConfigFetchResult {
         var request = URLRequest(url: AppConfiguration.configURL)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Accept")
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.timeoutInterval = 4
+        request.timeoutInterval = timeoutInterval
 
         do {
             request.httpBody = try JSONSerialization.data(
