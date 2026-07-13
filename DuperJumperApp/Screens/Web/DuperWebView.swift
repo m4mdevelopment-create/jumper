@@ -315,7 +315,11 @@ struct DuperWebView: UIViewRepresentable {
         private var lastRequestedURL: URL?
         private var isRecoveringFromRedirectError = false
         private var focusedInputWorkItem: DispatchWorkItem?
-        private var lastKeyboardWebViewSize: CGSize = .zero
+        private var focusedInputCheckGeneration = 0
+        private var keyboardIsVisible = false
+        private var keyboardSessionGeneration = 0
+        private var pendingRestoreSessionID: Int?
+        private var keyboardRestoreWorkItem: DispatchWorkItem?
         private var httpUpgradeAttempts: [String: Int] = [:]
 
         private static let maxHTTPUpgradeAttemptsPerURL = 3
@@ -333,6 +337,7 @@ struct DuperWebView: UIViewRepresentable {
 
         deinit {
             focusedInputWorkItem?.cancel()
+            keyboardRestoreWorkItem?.cancel()
             NotificationCenter.default.removeObserver(self)
         }
 
@@ -397,24 +402,33 @@ struct DuperWebView: UIViewRepresentable {
         }
 
         @objc private func keyboardWillShow(_ notification: Notification) {
+            activateKeyboardSessionIfNeeded()
             logKeyboardNotification("will-show", notification: notification)
         }
 
         @objc private func keyboardDidShow(_ notification: Notification) {
+            activateKeyboardSessionIfNeeded()
             logKeyboardNotification("did-show", notification: notification)
-            if shouldScheduleFocusedInputVisibilityCheck() {
-                scheduleFocusedInputVisibilityCheck(source: "keyboard-did-show")
-            }
+            scheduleFocusedInputVisibilityCheck(source: "keyboard-did-show")
         }
 
         @objc private func keyboardWillHide(_ notification: Notification) {
+            let sessionID = keyboardSessionGeneration
+            pendingRestoreSessionID = sessionID
+            keyboardIsVisible = false
+            cancelFocusedInputVisibilityCheck()
+            deactivateKeyboardScrollSession(sessionID: sessionID)
             logKeyboardNotification("will-hide", notification: notification)
         }
 
         @objc private func keyboardDidHide(_ notification: Notification) {
             logKeyboardNotification("did-hide", notification: notification)
-            focusedInputWorkItem?.cancel()
-            lastKeyboardWebViewSize = .zero
+            guard !keyboardIsVisible else { return }
+            cancelFocusedInputVisibilityCheck()
+
+            if let sessionID = pendingRestoreSessionID {
+                scheduleKeyboardScrollSessionRestore(sessionID: sessionID)
+            }
         }
 
         @objc private func keyboardWillChangeFrame(_ notification: Notification) {
@@ -444,161 +458,554 @@ struct DuperWebView: UIViewRepresentable {
             )
         }
 
-        private func shouldScheduleFocusedInputVisibilityCheck() -> Bool {
-            guard let webView else { return false }
-
-            let currentSize = webView.bounds.size
-            let isLandscape = currentSize.width > currentSize.height
-            let hadPreviousSize = lastKeyboardWebViewSize != .zero
-            let wasPortrait = lastKeyboardWebViewSize.height > lastKeyboardWebViewSize.width
-            lastKeyboardWebViewSize = currentSize
-
-            guard isLandscape else { return false }
-            return !hadPreviousSize || wasPortrait
+        private func activateKeyboardSessionIfNeeded() {
+            if !keyboardIsVisible {
+                keyboardSessionGeneration += 1
+            }
+            keyboardIsVisible = true
+            keyboardRestoreWorkItem?.cancel()
+            keyboardRestoreWorkItem = nil
+            pendingRestoreSessionID = nil
+            captureKeyboardScrollSessionIfNeeded(sessionID: keyboardSessionGeneration)
         }
 
-        private func scheduleFocusedInputVisibilityCheck(source: String) {
-            guard let webView, webView.bounds.width > webView.bounds.height else { return }
+        private func scheduleKeyboardScrollSessionRestore(sessionID: Int) {
+            keyboardRestoreWorkItem?.cancel()
+
+            let workItem = DispatchWorkItem { [weak self] in
+                guard let self else { return }
+                guard
+                    !self.keyboardIsVisible,
+                    self.pendingRestoreSessionID == sessionID
+                else { return }
+
+                self.restoreKeyboardScrollSession(sessionID: sessionID)
+                self.pendingRestoreSessionID = nil
+                self.keyboardRestoreWorkItem = nil
+            }
+            keyboardRestoreWorkItem = workItem
+
+            // iOS emits a zero-duration hide/show pair when changing input types.
+            // Waiting here prevents the old field from restoring scroll while the
+            // next field and keyboard are still settling.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.32, execute: workItem)
+        }
+
+        private func cancelFocusedInputVisibilityCheck() {
+            focusedInputWorkItem?.cancel()
+            focusedInputWorkItem = nil
+            focusedInputCheckGeneration += 1
+            webView?.evaluateJavaScript(
+                "window.__duperKeyboardLatestCheck = \(focusedInputCheckGeneration);"
+            )
+        }
+
+        private func scheduleFocusedInputVisibilityCheck(
+            source: String,
+            delay: TimeInterval = 0.08
+        ) {
+            guard
+                keyboardIsVisible,
+                let webView,
+                webView.bounds.width > webView.bounds.height
+            else { return }
 
             focusedInputWorkItem?.cancel()
+            focusedInputCheckGeneration += 1
+            let checkID = focusedInputCheckGeneration
+            let sessionID = keyboardSessionGeneration
+            webView.evaluateJavaScript("window.__duperKeyboardLatestCheck = \(checkID);")
+
             let workItem = DispatchWorkItem { [weak self] in
-                self?.ensureFocusedInputVisible(source: source)
+                self?.ensureFocusedInputVisible(
+                    source: source,
+                    checkID: checkID,
+                    sessionID: sessionID
+                )
             }
             focusedInputWorkItem = workItem
 
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.25, execute: workItem)
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: workItem)
         }
 
-        private func ensureFocusedInputVisible(source: String) {
-            guard let webView, webView.bounds.width > webView.bounds.height else { return }
+        private func captureKeyboardScrollSessionIfNeeded(sessionID: Int) {
+            guard
+                let webView,
+                webView.bounds.width > webView.bounds.height
+            else { return }
 
             let script = """
             (function() {
                 var element = document.activeElement;
-                if (!element || !element.matches) {
-                    return { status: 'no-active-element' };
+                if (!element || !element.matches || !element.matches('input, textarea, select, [contenteditable=""], [contenteditable="true"]')) {
+                    return { status: 'not-editable' };
                 }
 
-                var isEditable = element.matches('input, textarea, select, [contenteditable=""], [contenteditable="true"]');
-                if (!isEditable) {
-                    return { status: 'not-editable', element: element.tagName ? element.tagName.toLowerCase() : 'unknown' };
+                var existing = window.__duperKeyboardScrollSession;
+                if (existing && existing.active && existing.id === \(sessionID)) {
+                    return { status: 'existing', session: existing.id };
+                }
+                if (existing) {
+                    existing.id = \(sessionID);
+                    existing.active = true;
+                    return {
+                        status: 'resumed',
+                        session: existing.id,
+                        entries: existing.entries.length,
+                        scroll: Math.round(window.scrollX || 0) + ',' + Math.round(window.scrollY || 0)
+                    };
                 }
 
-                var vv = window.visualViewport;
-                if (!vv) {
-                    return { status: 'no-visual-viewport' };
-                }
-
-                var topLimit = Math.max(0, vv.offsetTop) + 10;
-                var bottomLimit = vv.offsetTop + vv.height - 10;
-
-                function isVisible(rect) {
-                    return rect.top >= topLimit && rect.bottom <= bottomLimit;
-                }
-
-                function scrollableAncestors(node) {
-                    var ancestors = [];
-                    var current = node.parentElement;
-
-                    while (current && current !== document.body && current !== document.documentElement) {
-                        if (current.scrollHeight > current.clientHeight + 1) {
-                            ancestors.push(current);
-                        }
-                        current = current.parentElement;
-                    }
-
-                    var scrollingElement = document.scrollingElement || document.documentElement;
-                    if (scrollingElement) {
-                        ancestors.push(scrollingElement);
-                    }
-
-                    return ancestors;
-                }
-
-                function labelFor(node) {
-                    if (!node || !node.tagName) { return 'unknown'; }
-                    return [
-                        node.tagName.toLowerCase(),
-                        node.id ? ('#' + node.id) : '',
-                        node.className && typeof node.className === 'string' ? ('.' + node.className.trim().split(/\\s+/).slice(0, 2).join('.')) : ''
-                    ].join('');
-                }
-
-                function centerDelta(rect) {
-                    var visibleHeight = Math.max(1, bottomLimit - topLimit);
-                    var targetTop = topLimit + Math.max(0, (visibleHeight - rect.height) / 2);
-                    return rect.top - targetTop;
-                }
-
-                var rect = element.getBoundingClientRect();
-                var wasHidden = !isVisible(rect);
-                var actions = [];
-
-                if (wasHidden) {
-                    element.scrollIntoView({
-                        block: 'center',
-                        inline: 'nearest',
-                        behavior: 'auto'
+                var entries = [];
+                function addNode(node) {
+                    if (!node || entries.some(function(entry) { return entry.node === node; })) { return; }
+                    entries.push({
+                        node: node,
+                        top: Number(node.scrollTop || 0),
+                        left: Number(node.scrollLeft || 0),
+                        programmaticTop: 0,
+                        programmaticLeft: 0
                     });
-                    actions.push('scrollIntoView');
-
-                    var ancestors = scrollableAncestors(element);
-                    for (var pass = 0; pass < 3; pass++) {
-                        var currentRect = element.getBoundingClientRect();
-                        if (isVisible(currentRect)) { break; }
-
-                        var delta = centerDelta(currentRect);
-                        if (Math.abs(delta) < 1) { break; }
-
-                        for (var i = 0; i < ancestors.length; i++) {
-                            var ancestor = ancestors[i];
-                            var beforeScroll = ancestor.scrollTop;
-                            var maxScroll = Math.max(0, ancestor.scrollHeight - ancestor.clientHeight);
-                            var nextScroll = Math.max(0, Math.min(maxScroll, beforeScroll + delta));
-
-                            if (Math.abs(nextScroll - beforeScroll) < 1) { continue; }
-
-                            ancestor.scrollTop = nextScroll;
-                            actions.push(labelFor(ancestor) + ':' + Math.round(beforeScroll) + '->' + Math.round(ancestor.scrollTop));
-                            break;
-                        }
-                    }
                 }
 
-                var updatedRect = element.getBoundingClientRect();
-                var finalVisible = isVisible(updatedRect);
+                addNode(document.scrollingElement || document.documentElement);
+                var current = element.parentElement;
+                while (current && current !== document.body && current !== document.documentElement) {
+                    if (current.scrollHeight > current.clientHeight + 1 || current.scrollWidth > current.clientWidth + 1) {
+                        addNode(current);
+                    }
+                    current = current.parentElement;
+                }
+
+                window.__duperKeyboardScrollSession = {
+                    id: \(sessionID),
+                    active: true,
+                    userInteracted: false,
+                    windowX: Number(window.scrollX || 0),
+                    windowY: Number(window.scrollY || 0),
+                    entries: entries
+                };
+
+                if (!window.__duperKeyboardInteractionTrackerInstalled) {
+                    var markUserInteraction = function() {
+                        var session = window.__duperKeyboardScrollSession;
+                        if (session && session.active) {
+                            session.userInteracted = true;
+                        }
+                    };
+                    document.addEventListener('touchmove', markUserInteraction, { capture: true, passive: true });
+                    document.addEventListener('wheel', markUserInteraction, { capture: true, passive: true });
+                    window.__duperKeyboardInteractionTrackerInstalled = true;
+                }
+
                 return {
-                    status: wasHidden ? (finalVisible ? 'scrolled-visible' : 'scrolled-still-hidden') : 'visible',
-                    element: [
-                        element.tagName ? element.tagName.toLowerCase() : 'unknown',
-                        element.id ? ('#' + element.id) : '',
-                        element.name ? ('[name=' + element.name + ']') : '',
-                        element.type ? ('[type=' + element.type + ']') : ''
-                    ].join(''),
-                    before: 'top=' + Math.round(rect.top) + ',bottom=' + Math.round(rect.bottom),
-                    after: 'top=' + Math.round(updatedRect.top) + ',bottom=' + Math.round(updatedRect.bottom),
-                    actions: actions.join(';'),
-                    visual: Math.round(vv.width) + 'x' + Math.round(vv.height) + ' offset=' + Math.round(vv.offsetLeft) + ',' + Math.round(vv.offsetTop) + ' pageTop=' + Math.round(vv.pageTop),
+                    status: 'captured',
+                    session: \(sessionID),
+                    entries: entries.length,
                     scroll: Math.round(window.scrollX || 0) + ',' + Math.round(window.scrollY || 0)
                 };
             })();
             """
 
             webView.evaluateJavaScript(script) { [weak self] result, error in
-                var details = ["source=\(source)"]
+                if let error {
+                    self?.logCasinoInput(
+                        "keyboard-session-capture",
+                        details: ["session=\(sessionID)", "error=\(error.localizedDescription)"]
+                    )
+                    return
+                }
 
+                guard let result = result as? [String: Any] else { return }
+                let status = result["status"] as? String
+                guard status == "captured" || status == "resumed" else { return }
+
+                self?.logCasinoInput(
+                    "keyboard-session-capture",
+                    details: [
+                        "session=\(sessionID)",
+                        "status=\(status ?? "unknown")",
+                        "entries=\(Self.shortValueDescription(result["entries"] ?? 0))",
+                        "scroll=\(Self.shortValueDescription(result["scroll"] ?? ""))"
+                    ]
+                )
+            }
+        }
+
+        private func deactivateKeyboardScrollSession(sessionID: Int) {
+            webView?.evaluateJavaScript(
+                """
+                (function() {
+                    var session = window.__duperKeyboardScrollSession;
+                    if (session && session.id === \(sessionID)) {
+                        session.active = false;
+                    }
+                })();
+                """
+            )
+        }
+
+        private func restoreKeyboardScrollSession(sessionID: Int) {
+            guard let webView else { return }
+
+            let script = """
+            (function() {
+                var session = window.__duperKeyboardScrollSession;
+                if (!session || session.id !== \(sessionID)) {
+                    return { status: 'no-matching-session', session: \(sessionID) };
+                }
+
+                var restoreID = Number(session.id);
+                session.active = false;
+
+                function clamp(value, minimum, maximum) {
+                    return Math.max(minimum, Math.min(maximum, value));
+                }
+
+                function restoreIfCurrent() {
+                    if (window.__duperKeyboardScrollSession !== session
+                        || Number(session.id) !== restoreID
+                        || session.active) {
+                        return false;
+                    }
+
+                    for (var index = 0; index < session.entries.length; index++) {
+                        var entry = session.entries[index];
+                        var node = entry.node;
+                        if (!node || !node.isConnected) { continue; }
+
+                        var maxTop = Math.max(0, node.scrollHeight - node.clientHeight);
+                        var maxLeft = Math.max(0, node.scrollWidth - node.clientWidth);
+                        var targetTop = session.userInteracted
+                            ? Number(node.scrollTop || 0) - Number(entry.programmaticTop || 0)
+                            : Number(entry.top || 0);
+                        var targetLeft = session.userInteracted
+                            ? Number(node.scrollLeft || 0) - Number(entry.programmaticLeft || 0)
+                            : Number(entry.left || 0);
+
+                        node.scrollTop = clamp(targetTop, 0, maxTop);
+                        node.scrollLeft = clamp(targetLeft, 0, maxLeft);
+                    }
+
+                    if (!session.userInteracted) {
+                        window.scrollTo(session.windowX, session.windowY);
+                    }
+                    return true;
+                }
+
+                restoreIfCurrent();
+                setTimeout(restoreIfCurrent, 80);
+                setTimeout(function() {
+                    restoreIfCurrent();
+                    if (window.__duperKeyboardScrollSession === session
+                        && Number(session.id) === restoreID
+                        && !session.active) {
+                        window.__duperKeyboardScrollSession = null;
+                    }
+                }, 220);
+
+                return {
+                    status: 'restoring',
+                    session: session.id,
+                    userInteracted: session.userInteracted ? 1 : 0,
+                    target: Math.round(session.windowX) + ',' + Math.round(session.windowY)
+                };
+            })();
+            """
+
+            webView.evaluateJavaScript(script) { [weak self] result, error in
+                var details = ["session=\(sessionID)"]
                 if let error {
                     details.append("error=\(error.localizedDescription)")
                 } else if let result = result as? [String: Any] {
-                    for key in ["status", "element", "before", "after", "actions", "visual", "scroll"] {
+                    for key in ["status", "userInteracted", "target"] {
                         if let value = result[key] {
                             details.append("\(key)=\(Self.shortValueDescription(value))")
                         }
                     }
-                } else if let result {
-                    details.append("result=\(Self.shortValueDescription(result))")
+                }
+                self?.logCasinoInput("keyboard-session-restore", details: details)
+            }
+        }
+
+        private func ensureFocusedInputVisible(
+            source: String,
+            checkID: Int,
+            sessionID: Int
+        ) {
+            guard let webView, webView.bounds.width > webView.bounds.height else { return }
+
+            let script = """
+            function editable(element) {
+                return element && element.matches && element.matches('input, textarea, select, [contenteditable=""], [contenteditable="true"]');
+            }
+
+            function labelFor(node) {
+                if (!node || !node.tagName) { return 'unknown'; }
+                return [
+                    node.tagName.toLowerCase(),
+                    node.id ? ('#' + node.id) : '',
+                    node.className && typeof node.className === 'string' ? ('.' + node.className.trim().split(/\\s+/).slice(0, 2).join('.')) : ''
+                ].join('');
+            }
+
+            function elementLabel(element) {
+                return [
+                    element.tagName ? element.tagName.toLowerCase() : 'unknown',
+                    element.id ? ('#' + element.id) : '',
+                    element.name ? ('[name=' + element.name + ']') : '',
+                    element.type ? ('[type=' + element.type + ']') : ''
+                ].join('');
+            }
+
+            function measure(element, viewport) {
+                var rect = element.getBoundingClientRect();
+                return {
+                    width: Number(viewport.width),
+                    height: Number(viewport.height),
+                    offsetLeft: Number(viewport.offsetLeft),
+                    offsetTop: Number(viewport.offsetTop),
+                    pageLeft: Number(viewport.pageLeft),
+                    pageTop: Number(viewport.pageTop),
+                    scrollX: Number(window.scrollX || 0),
+                    scrollY: Number(window.scrollY || 0),
+                    rectTop: Number(rect.top),
+                    rectBottom: Number(rect.bottom)
+                };
+            }
+
+            function nearlyEqual(left, right) {
+                return Math.abs(left - right) < 0.75;
+            }
+
+            function sameGeometry(left, right) {
+                return nearlyEqual(left.width, right.width)
+                    && nearlyEqual(left.height, right.height)
+                    && nearlyEqual(left.offsetLeft, right.offsetLeft)
+                    && nearlyEqual(left.offsetTop, right.offsetTop)
+                    && nearlyEqual(left.pageLeft, right.pageLeft)
+                    && nearlyEqual(left.pageTop, right.pageTop)
+                    && nearlyEqual(left.scrollX, right.scrollX)
+                    && nearlyEqual(left.scrollY, right.scrollY)
+                    && nearlyEqual(left.rectTop, right.rectTop)
+                    && nearlyEqual(left.rectBottom, right.rectBottom);
+            }
+
+            function activeSession() {
+                var session = window.__duperKeyboardScrollSession;
+                if (!session || !session.active || session.id !== Number(sessionID)) { return null; }
+                if (window.__duperKeyboardLatestCheck !== Number(checkID)) { return null; }
+                return session;
+            }
+
+            var session = activeSession();
+            if (!session) {
+                return { status: 'cancelled-or-no-session', session: Number(sessionID) };
+            }
+
+            var element = document.activeElement;
+            if (!editable(element)) {
+                return { status: 'not-editable' };
+            }
+
+            var viewport = window.visualViewport;
+            if (!viewport) {
+                return { status: 'no-visual-viewport' };
+            }
+
+            var previous = measure(element, viewport);
+            var stableSamples = 0;
+            var attempts = 0;
+
+            for (attempts = 1; attempts <= 15; attempts++) {
+                await new Promise(function(resolve) { setTimeout(resolve, 80); });
+
+                if (!activeSession()) {
+                    return { status: 'superseded', session: Number(sessionID), stability: attempts };
+                }
+                if (document.activeElement !== element) {
+                    return { status: 'focus-changed', session: Number(sessionID), stability: attempts };
+                }
+
+                var current = measure(element, viewport);
+                if (sameGeometry(previous, current)) {
+                    stableSamples += 1;
                 } else {
-                    details.append("result=nil")
+                    stableSamples = 0;
+                }
+                previous = current;
+
+                if (stableSamples >= 4) { break; }
+            }
+
+            if (stableSamples < 4) {
+                return {
+                    status: 'viewport-unstable',
+                    session: Number(sessionID),
+                    stability: attempts,
+                    visual: Math.round(viewport.width) + 'x' + Math.round(viewport.height) + ' offset=' + Math.round(viewport.offsetLeft) + ',' + Math.round(viewport.offsetTop) + ' pageTop=' + Math.round(viewport.pageTop),
+                    scroll: Math.round(window.scrollX || 0) + ',' + Math.round(window.scrollY || 0)
+                };
+            }
+
+            var topLimit = 10;
+            var bottomLimit = viewport.height - 10;
+
+            function screenRect(rect) {
+                var scrollTop = Number(window.scrollY || 0);
+                var pageTop = Number(viewport.pageTop);
+                if (!Number.isFinite(pageTop)) {
+                    pageTop = scrollTop + Number(viewport.offsetTop || 0);
+                }
+
+                var layoutToVisualOffset = scrollTop - pageTop;
+                return {
+                    top: rect.top + layoutToVisualOffset,
+                    bottom: rect.bottom + layoutToVisualOffset
+                };
+            }
+
+            function isVisible(rect) {
+                var visualRect = screenRect(rect);
+                return visualRect.top >= topLimit && visualRect.bottom <= bottomLimit;
+            }
+
+            function visibilityDelta(rect) {
+                var visualRect = screenRect(rect);
+                if (visualRect.top < topLimit) { return visualRect.top - topLimit; }
+                if (visualRect.bottom > bottomLimit) { return visualRect.bottom - bottomLimit; }
+                return 0;
+            }
+
+            function addCandidate(candidates, node) {
+                if (!node || candidates.some(function(candidate) { return candidate === node; })) { return; }
+                candidates.push(node);
+            }
+
+            var pageScroller = document.scrollingElement || document.documentElement;
+
+            function scrollCandidates(node) {
+                var candidates = [];
+
+                var current = node.parentElement;
+                while (current && current !== document.body && current !== document.documentElement) {
+                    if (current.scrollHeight > current.clientHeight + 1) {
+                        addCandidate(candidates, current);
+                    }
+                    current = current.parentElement;
+                }
+                return candidates;
+            }
+
+            function sessionEntry(node) {
+                for (var index = 0; index < session.entries.length; index++) {
+                    if (session.entries[index].node === node) { return session.entries[index]; }
+                }
+
+                var entry = {
+                    node: node,
+                    top: Number(node.scrollTop || 0),
+                    left: Number(node.scrollLeft || 0),
+                    programmaticTop: 0,
+                    programmaticLeft: 0
+                };
+                session.entries.push(entry);
+                return entry;
+            }
+
+            var rect = element.getBoundingClientRect();
+            var wasHidden = !isVisible(rect);
+            var actions = [];
+
+            if (wasHidden) {
+                var candidates = scrollCandidates(element);
+                for (var pass = 0; pass < 4; pass++) {
+                    if (!activeSession() || document.activeElement !== element) {
+                        return { status: 'superseded-during-scroll', session: Number(sessionID) };
+                    }
+
+                    var currentRect = element.getBoundingClientRect();
+                    if (isVisible(currentRect)) { break; }
+
+                    var delta = visibilityDelta(currentRect);
+                    if (Math.abs(delta) < 0.75) { break; }
+
+                    var moved = false;
+                    for (var index = 0; index < candidates.length; index++) {
+                        var candidate = candidates[index];
+                        var beforeScroll = candidate === pageScroller
+                            ? Number(window.scrollY || candidate.scrollTop || 0)
+                            : Number(candidate.scrollTop || 0);
+                        var maxScroll = Math.max(0, candidate.scrollHeight - candidate.clientHeight);
+                        var nextScroll = Math.max(0, Math.min(maxScroll, beforeScroll + delta));
+                        if (Math.abs(nextScroll - beforeScroll) < 0.75) { continue; }
+
+                        if (candidate === pageScroller) {
+                            window.scrollTo(window.scrollX || 0, nextScroll);
+                        } else {
+                            candidate.scrollTop = nextScroll;
+                        }
+
+                        var actualScroll = candidate === pageScroller
+                            ? Number(window.scrollY || candidate.scrollTop || 0)
+                            : Number(candidate.scrollTop || 0);
+                        if (Math.abs(actualScroll - beforeScroll) < 0.75) { continue; }
+
+                        var entry = sessionEntry(candidate);
+                        entry.programmaticTop += actualScroll - beforeScroll;
+                        actions.push(labelFor(candidate) + ':' + Math.round(beforeScroll) + '->' + Math.round(actualScroll));
+                        moved = true;
+                        break;
+                    }
+
+                    if (!moved) { break; }
+                }
+            }
+
+            var updatedRect = element.getBoundingClientRect();
+            var finalVisible = isVisible(updatedRect);
+            var originalScreenRect = screenRect(rect);
+            var updatedScreenRect = screenRect(updatedRect);
+            return {
+                status: wasHidden ? (finalVisible ? 'scrolled-visible' : 'scrolled-still-hidden') : 'visible',
+                session: Number(sessionID),
+                stability: attempts,
+                element: elementLabel(element),
+                before: 'top=' + Math.round(rect.top) + ',bottom=' + Math.round(rect.bottom),
+                after: 'top=' + Math.round(updatedRect.top) + ',bottom=' + Math.round(updatedRect.bottom),
+                beforeScreen: 'top=' + Math.round(originalScreenRect.top) + ',bottom=' + Math.round(originalScreenRect.bottom),
+                afterScreen: 'top=' + Math.round(updatedScreenRect.top) + ',bottom=' + Math.round(updatedScreenRect.bottom),
+                actions: actions.join(';'),
+                visual: Math.round(viewport.width) + 'x' + Math.round(viewport.height) + ' offset=' + Math.round(viewport.offsetLeft) + ',' + Math.round(viewport.offsetTop) + ' pageTop=' + Math.round(viewport.pageTop),
+                scroll: Math.round(window.scrollX || 0) + ',' + Math.round(window.scrollY || 0)
+            };
+            """
+
+            Task { @MainActor [weak self, weak webView] in
+                guard let webView else { return }
+                var details = ["source=\(source)"]
+
+                do {
+                    let value = try await webView.callAsyncJavaScript(
+                        script,
+                        arguments: ["checkID": checkID, "sessionID": sessionID],
+                        in: nil,
+                        contentWorld: .page
+                    )
+
+                    if let value = value as? [String: Any] {
+                        for key in ["status", "session", "stability", "element", "before", "after", "beforeScreen", "afterScreen", "actions", "visual", "scroll"] {
+                            if let item = value[key] {
+                                details.append("\(key)=\(Self.shortValueDescription(item))")
+                            }
+                        }
+                    } else if let value {
+                        details.append("result=\(Self.shortValueDescription(value))")
+                    } else {
+                        details.append("result=nil")
+                    }
+                } catch {
+                    details.append("error=\(error.localizedDescription)")
                 }
 
                 self?.logCasinoInput("native-focused-input-visibility-check", details: details)
@@ -619,6 +1026,19 @@ struct DuperWebView: UIViewRepresentable {
             }
 
             logCasino(Self.casinoTag(for: type), event: type, body: body)
+
+            guard message.frameInfo.isMainFrame else { return }
+            switch type {
+            case "focusin":
+                captureKeyboardScrollSessionIfNeeded(sessionID: keyboardSessionGeneration)
+            case "orientationchange":
+                scheduleFocusedInputVisibilityCheck(
+                    source: "orientationchange",
+                    delay: 0.45
+                )
+            default:
+                break
+            }
         }
 
         private func logCasino(_ tag: String, event: String, body: [String: Any]) {
