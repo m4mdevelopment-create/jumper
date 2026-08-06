@@ -58,6 +58,8 @@
 			);
 			buildRules = (
 			);
+			dependencies = (
+			);
 			fileSystemSynchronizedGroups = (
 				84C043C52FE2DD6400A28614 /* DuperJumperApp */,
 			);
