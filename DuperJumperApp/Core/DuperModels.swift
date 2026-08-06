@@ -334,6 +334,14 @@ struct Achievement: Identifiable, Codable, Hashable {
             metric: .totalRounds,
             targetValue: 10,
             isUnlocked: false
+        ),
+        Achievement(
+            id: "guide-explorer",
+            title: "Guide Explorer",
+            summary: "Read every quick guide.",
+            metric: .guideReads,
+            targetValue: GuideArticle.placeholders.count,
+            isUnlocked: false
         )
     ]
 }

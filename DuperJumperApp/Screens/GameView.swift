@@ -12,6 +12,44 @@ struct GameView: View {
         systemReduceMotion || store.settings.reduceMotion
     }
 
+    private var activeRunBoosts: [ActiveRunBoost] {
+        guard store.progress.isRoundActive else { return [] }
+
+        var boosts: [ActiveRunBoost] = []
+
+        if store.isShieldAvailable {
+            boosts.append(
+                ActiveRunBoost(
+                    id: "shield",
+                    title: "Shield ready",
+                    iconName: "shield.fill",
+                    accent: DJTheme.stableBlue
+                )
+            )
+        }
+
+        boosts.append(contentsOf: store.activeRoundBonuses.map { bonus in
+            switch bonus.kind {
+            case .saferNextJump:
+                ActiveRunBoost(
+                    id: bonus.id,
+                    title: "Safe next jump",
+                    iconName: "checkmark.shield.fill",
+                    accent: DJTheme.signalMint
+                )
+            case .surgeMultiplier:
+                ActiveRunBoost(
+                    id: bonus.id,
+                    title: "Surge active",
+                    iconName: "sparkles",
+                    accent: DJTheme.pulseMagenta
+                )
+            }
+        })
+
+        return boosts
+    }
+
     private var nextHeight: Int {
         store.progress.currentHeight + 1
     }
@@ -91,6 +129,11 @@ struct GameView: View {
         }
         .onDisappear {
             AppDelegate.restoreDefaultOrientations()
+        }
+        .onChange(of: store.localProgressResetRevision) { _, _ in
+            failVisual = nil
+            landingVisual = nil
+            actionFeedback = nil
         }
     }
 
@@ -255,6 +298,23 @@ struct GameView: View {
                 MiniDecisionChip(title: "Multiplier", value: multiplierText(store.progress.currentMultiplier), accent: DJTheme.electricCyan)
                 MiniDecisionChip(title: "Ready", value: "\(pointsText(store.currentPotentialPoints)) pts", accent: DJTheme.signalMint)
                 MiniDecisionChip(title: "Risk", value: percentText(store.currentJumpRisk), accent: currentRiskState.accent)
+            }
+
+            JumpReadinessMeter(
+                energy: store.currentJumpEnergy,
+                fill: store.settings.effectiveMeterFill,
+                highContrast: store.settings.highContrastMeter,
+                reduceMotion: reduceMotion
+            )
+
+            if !activeRunBoosts.isEmpty {
+                HStack(spacing: 6) {
+                    ForEach(activeRunBoosts) { boost in
+                        ActiveRunBoostChip(boost: boost)
+                    }
+
+                    Spacer(minLength: 0)
+                }
             }
         }
         .padding(8)
@@ -994,6 +1054,75 @@ private struct MiniDecisionChip: View {
         .padding(.horizontal, 10)
         .padding(.vertical, 8)
         .background(accent.opacity(0.12), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+    }
+}
+
+private struct ActiveRunBoost: Identifiable {
+    let id: String
+    let title: String
+    let iconName: String
+    let accent: Color
+}
+
+private struct ActiveRunBoostChip: View {
+    let boost: ActiveRunBoost
+
+    var body: some View {
+        Label(boost.title, systemImage: boost.iconName)
+            .font(DJTheme.labelFont(11))
+            .foregroundStyle(boost.accent)
+            .lineLimit(1)
+            .padding(.horizontal, 9)
+            .padding(.vertical, 6)
+            .background(boost.accent.opacity(0.14), in: Capsule())
+            .overlay(
+                Capsule()
+                    .stroke(boost.accent.opacity(0.42), lineWidth: 1)
+            )
+            .accessibilityLabel(boost.title)
+    }
+}
+
+private struct JumpReadinessMeter: View {
+    let energy: Double
+    let fill: Color
+    let highContrast: Bool
+    let reduceMotion: Bool
+
+    private var normalizedEnergy: Double {
+        min(max(energy, 0), 1)
+    }
+
+    var body: some View {
+        VStack(spacing: 5) {
+            HStack(spacing: 6) {
+                Label("Jump Readiness", systemImage: "bolt.fill")
+                    .font(DJTheme.labelFont(10))
+                    .foregroundStyle(DJTheme.textSecondary)
+
+                Spacer(minLength: 0)
+
+                Text(normalizedEnergy.formatted(.percent.precision(.fractionLength(0))))
+                    .font(DJTheme.monoFont(12, weight: .black))
+                    .foregroundStyle(fill)
+            }
+
+            GeometryReader { proxy in
+                ZStack(alignment: .leading) {
+                    Capsule()
+                        .fill(DJTheme.line)
+
+                    Capsule()
+                        .fill(fill)
+                        .frame(width: proxy.size.width * CGFloat(normalizedEnergy))
+                }
+            }
+            .frame(height: highContrast ? 10 : 7)
+        }
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("Jump readiness")
+        .accessibilityValue(normalizedEnergy.formatted(.percent.precision(.fractionLength(0))))
+        .animation(reduceMotion ? nil : .easeOut(duration: 0.20), value: normalizedEnergy)
     }
 }
 

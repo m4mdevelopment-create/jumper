@@ -21,20 +21,6 @@
                ReferencedContainer = "container:DuperJumperApp.xcodeproj">
             </BuildableReference>
          </BuildActionEntry>
-         <BuildActionEntry
-            buildForTesting = "YES"
-            buildForRunning = "YES"
-            buildForProfiling = "YES"
-            buildForArchiving = "YES"
-            buildForAnalyzing = "YES">
-            <BuildableReference
-               BuildableIdentifier = "primary"
-               BlueprintIdentifier = "9A1000012FEF000100000045"
-               BuildableName = "DuperJumperNotificationService.appex"
-               BlueprintName = "DuperJumperNotificationService"
-               ReferencedContainer = "container:DuperJumperApp.xcodeproj">
-            </BuildableReference>
-         </BuildActionEntry>
       </BuildActionEntries>
    </BuildAction>
    <TestAction

@@ -1,6 +1,9 @@
 import SwiftUI
 
 struct SettingsView: View {
+    private static let privacyPolicyURL = URL(string: "https://steadyflowplayjumpingblock.com/privacy-policy.html")!
+    private static let supportURL = URL(string: "https://steadyflowplayjumpingblock.com/support.html")!
+
     @Environment(DuperGameStore.self) private var store
     @Environment(\.accessibilityReduceMotion) private var systemReduceMotion
     @Environment(\.openURL) private var openURL
@@ -119,7 +122,7 @@ struct SettingsView: View {
                     title: "Privacy Policy",
                     subtitle: "Data and privacy details.",
                     systemImage: "hand.raised.fill",
-                    url: AppConfiguration.privacyPolicyURL
+                    url: Self.privacyPolicyURL
                 )
 
                 SettingsDivider()
@@ -128,7 +131,7 @@ struct SettingsView: View {
                     title: "Support",
                     subtitle: "Help and contact details.",
                     systemImage: "questionmark.circle.fill",
-                    url: AppConfiguration.supportURL
+                    url: Self.supportURL
                 )
             }
         }

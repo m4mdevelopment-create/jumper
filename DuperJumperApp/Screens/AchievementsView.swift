@@ -415,6 +415,8 @@ private extension Achievement {
             "arrow.counterclockwise.circle.fill"
         case "tower-regular":
             "calendar.circle.fill"
+        case "guide-explorer":
+            "book.pages.fill"
         default:
             isUnlocked ? "checkmark.circle.fill" : "sparkles"
         }

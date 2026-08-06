@@ -87,7 +87,7 @@ struct OnboardingView: View {
                 .font(DJTheme.labelFont(13))
                 .foregroundStyle(DJTheme.textSecondary)
                 .padding(.horizontal, 12)
-                .padding(.vertical, 8)
+                .frame(minHeight: 44)
                 .background(DJTheme.panel.opacity(0.72), in: Capsule())
                 .overlay(
                     Capsule()

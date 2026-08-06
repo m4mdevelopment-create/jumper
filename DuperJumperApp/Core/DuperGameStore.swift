@@ -9,6 +9,7 @@ final class DuperGameStore {
     private(set) var recentResults: [RoundResult]
     private(set) var achievements: [Achievement]
     private(set) var guideArticles: [GuideArticle]
+    private(set) var localProgressResetRevision = 0
     var settings: AppSettings
 
     @ObservationIgnored private let defaults: UserDefaults
@@ -300,6 +301,7 @@ final class DuperGameStore {
         achievements = initialState.achievements
         guideArticles = initialState.guideArticles
         settings = preservedSettings
+        localProgressResetRevision &+= 1
         persist()
     }
 

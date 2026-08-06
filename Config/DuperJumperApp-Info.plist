@@ -22,12 +22,6 @@
 	<string>$(CURRENT_PROJECT_VERSION)</string>
 	<key>LSRequiresIPhoneOS</key>
 	<true/>
-	<key>NSCameraUsageDescription</key>
-	<string>Web pages opened in the app can ask to upload a photo from the camera.</string>
-	<key>NSPhotoLibraryAddUsageDescription</key>
-	<string>Web pages opened in the app can save selected uploads when the site requests it.</string>
-	<key>NSPhotoLibraryUsageDescription</key>
-	<string>Web pages opened in the app can ask to upload a photo from the library.</string>
 	<key>UIApplicationSceneManifest</key>
 	<dict>
 		<key>UIApplicationSupportsMultipleScenes</key>
@@ -37,10 +31,6 @@
 	</dict>
 	<key>UIApplicationSupportsIndirectInputEvents</key>
 	<true/>
-	<key>UIBackgroundModes</key>
-	<array>
-		<string>remote-notification</string>
-	</array>
 	<key>UILaunchScreen</key>
 	<dict/>
 	<key>UISupportedInterfaceOrientations</key>
